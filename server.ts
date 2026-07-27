@@ -12,8 +12,8 @@ const SQLITE_DB_PATH = path.join(process.cwd(), "registrations.sqlite");
 const MAX_SPOTS_PER_DATE = 38;
 const ADMIN_PASSWORD = "30012015";
 
-const SUPABASE_URL = process.env.SUPABASE_URL || "https://zrlcibersabcdobffvcx.supabase.co";
-const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY || "sb_publishable__AmbfXLnrNZnCCFRQh3SyQ_2vKQfSsf";
+const SUPABASE_URL = (process.env.SUPABASE_URL || "https://zrlcibersabcdobffvcx.supabase.co").trim().replace(/\/+$/, "");
+const SUPABASE_ANON_KEY = (process.env.SUPABASE_ANON_KEY || "sb_publishable__AmbfXLnrNZnCCFRQh3SyQ_2vKQfSsf").trim();
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
@@ -119,7 +119,7 @@ async function getAllRegistrations(): Promise<{ registrations: Registration[]; s
       supabaseRegs = data.map(normalizeSupabaseRow);
       isSupabaseOk = true;
     } else if (error) {
-      console.warn("Supabase select notice/error:", error.message);
+      console.log("Supabase notice:", error.message);
     }
   } catch (err) {
     console.warn("Supabase fetch exception:", err);

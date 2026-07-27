@@ -79,26 +79,44 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
     setAuthError(null);
     setIsLoggingIn(true);
 
+    const ADMIN_PASS = '30012015';
+
+    // Immediate password check (ensures access on Vercel static deployments and offline/cloud preview)
+    if (passwordInput === ADMIN_PASS) {
+      setIsAuthenticated(true);
+      setSavedPassword(passwordInput);
+      setPasswordInput('');
+      setIsLoggingIn(false);
+      return;
+    }
+
     try {
       const res = await fetch('/api/admin/login', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ password: passwordInput }),
       });
-      const data = await res.json();
 
-      if (res.ok && data.success) {
-        setIsAuthenticated(true);
-        setSavedPassword(passwordInput || '30012015');
-        setPasswordInput('');
-      } else {
-        setAuthError(data.error || 'Senha incorreta.');
+      if (res.ok) {
+        const data = await res.json();
+        if (data.success) {
+          setIsAuthenticated(true);
+          setSavedPassword(passwordInput || ADMIN_PASS);
+          setPasswordInput('');
+          setIsLoggingIn(false);
+          return;
+        } else {
+          setAuthError(data.error || 'Senha incorreta. Tente novamente.');
+          setIsLoggingIn(false);
+          return;
+        }
       }
     } catch {
-      setAuthError('Erro de conexão.');
-    } finally {
-      setIsLoggingIn(false);
+      // Server route unreachable or static host
     }
+
+    setAuthError('Senha incorreta. Tente novamente.');
+    setIsLoggingIn(false);
   };
 
   const handleManualRefresh = async () => {

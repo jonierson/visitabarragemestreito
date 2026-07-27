@@ -13,9 +13,9 @@ const MAX_SPOTS_PER_DATE = 38;
 const ADMIN_PASSWORD = "30012015";
 
 const SUPABASE_URL = (process.env.SUPABASE_URL || "https://zrlcibersabcdobffvcx.supabase.co").trim().replace(/\/+$/, "");
-const SUPABASE_ANON_KEY = (process.env.SUPABASE_ANON_KEY || "sb_publishable__AmbfXLnrNZnCCFRQh3SyQ_2vKQfSsf").trim();
+const SUPABASE_KEY = (process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY || process.env.SUPABASE_KEY || "sb_publishable__AmbfXLnrNZnCCFRQh3SyQ_2vKQfSsf").trim();
 
-const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
 let db: Database;
 
@@ -109,6 +109,59 @@ function normalizeSupabaseRow(row: any): Registration {
   };
 }
 
+async function syncLocalToSupabase() {
+  const localRegs = getLocalRegistrations();
+  if (localRegs.length === 0) return;
+
+  try {
+    const { data: remoteData, error } = await supabase.from("registrations").select("id");
+    if (error) return;
+
+    const remoteIds = new Set((remoteData || []).map((r: any) => String(r.id)));
+
+    for (const reg of localRegs) {
+      if (!remoteIds.has(reg.id)) {
+        // Try camelCase
+        let { error: err1 } = await supabase.from("registrations").insert([
+          {
+            id: reg.id,
+            nome: reg.nome,
+            turma: reg.turma,
+            dataVisita: reg.dataVisita,
+            createdAt: reg.createdAt,
+          },
+        ]);
+        if (err1) {
+          // Try snake_case
+          let { error: err2 } = await supabase.from("registrations").insert([
+            {
+              id: reg.id,
+              nome: reg.nome,
+              turma: reg.turma,
+              data_visita: reg.dataVisita,
+              created_at: reg.createdAt,
+            },
+          ]);
+          if (err2) {
+            // Try lowercase
+            await supabase.from("registrations").insert([
+              {
+                id: reg.id,
+                nome: reg.nome,
+                turma: reg.turma,
+                datavisita: reg.dataVisita,
+                createdat: reg.createdAt,
+              },
+            ]);
+          }
+        }
+      }
+    }
+  } catch {
+    // Ignore background sync errors
+  }
+}
+
 async function getAllRegistrations(): Promise<{ registrations: Registration[]; source: string }> {
   let supabaseRegs: Registration[] = [];
   let isSupabaseOk = false;
@@ -124,6 +177,9 @@ async function getAllRegistrations(): Promise<{ registrations: Registration[]; s
   } catch (err) {
     console.warn("Supabase fetch exception:", err);
   }
+
+  // Sync local records to Supabase asynchronously
+  syncLocalToSupabase();
 
   const localRegs = getLocalRegistrations();
 
@@ -306,6 +362,7 @@ async function startServer() {
 
       // Insert into Supabase
       try {
+        // Try camelCase first (matching "dataVisita" and "createdAt")
         let { error } = await supabase.from("registrations").insert([
           {
             id: newRegistration.id,
@@ -315,8 +372,10 @@ async function startServer() {
             createdAt: newRegistration.createdAt,
           },
         ]);
+
         if (error) {
-          // Fallback for snake_case column names
+          console.warn("Supabase insert attempt 1 (camelCase) notice:", error.message, error.code);
+          // Try snake_case (matching data_visita and created_at)
           const res2 = await supabase.from("registrations").insert([
             {
               id: newRegistration.id,
@@ -326,9 +385,11 @@ async function startServer() {
               created_at: newRegistration.createdAt,
             },
           ]);
+
           if (res2.error) {
-            // Fallback for lowercased column names
-            await supabase.from("registrations").insert([
+            console.warn("Supabase insert attempt 2 (snake_case) notice:", res2.error.message, res2.error.code);
+            // Try lowercase (matching datavisita and createdat)
+            const res3 = await supabase.from("registrations").insert([
               {
                 id: newRegistration.id,
                 nome: newRegistration.nome,
@@ -337,10 +398,20 @@ async function startServer() {
                 createdat: newRegistration.createdAt,
               },
             ]);
+
+            if (res3.error) {
+              console.error("Supabase insert error across all column formats:", res3.error.message, res3.error.code);
+            } else {
+              console.log("Supabase insert successful (lowercase column names):", newRegistration.id);
+            }
+          } else {
+            console.log("Supabase insert successful (snake_case column names):", newRegistration.id);
           }
+        } else {
+          console.log("Supabase insert successful (camelCase column names):", newRegistration.id);
         }
       } catch (err) {
-        console.warn("Supabase insert exception:", err);
+        console.error("Supabase insert exception:", err);
       }
 
       const { registrations: updatedRegistrations } = await getAllRegistrations();

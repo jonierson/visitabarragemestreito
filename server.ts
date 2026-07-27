@@ -292,301 +292,334 @@ function computeStats(registrations: Registration[]): VisitStats {
   };
 }
 
-async function startServer() {
-  db = await initDb();
+let isDbInitStarted = false;
+let dbInitPromise: Promise<Database | null> | null = null;
 
-  const app = express();
-  app.use(express.json());
-
-  // API Endpoints
-  app.get("/api/stats", async (req, res) => {
-    const { registrations } = await getAllRegistrations();
-    const stats = computeStats(registrations);
-    res.json(stats);
-  });
-
-  app.get("/api/registrations", async (req, res) => {
-    const { registrations, source } = await getAllRegistrations();
-    res.json({
-      registrations,
-      stats: computeStats(registrations),
-      dbEngine: source,
-      supabaseConnected: source.includes("Supabase"),
+export async function ensureDbInitialized() {
+  if (db) return db;
+  if (!isDbInitStarted) {
+    isDbInitStarted = true;
+    dbInitPromise = initDb().catch((err) => {
+      console.warn("initDb warning:", err);
+      return null;
     });
+  }
+  return dbInitPromise;
+}
+
+export const app = express();
+app.use(express.json());
+
+const apiRouter = express.Router();
+
+// API Endpoints on router
+apiRouter.get("/stats", async (req, res) => {
+  await ensureDbInitialized();
+  const { registrations } = await getAllRegistrations();
+  const stats = computeStats(registrations);
+  res.json(stats);
+});
+
+apiRouter.get("/registrations", async (req, res) => {
+  await ensureDbInitialized();
+  const { registrations, source } = await getAllRegistrations();
+  res.json({
+    registrations,
+    stats: computeStats(registrations),
+    dbEngine: source,
+    supabaseConnected: source.includes("Supabase"),
   });
+});
 
-  app.post("/api/register", async (req, res) => {
-    try {
-      const { nome, turma, dataVisita } = req.body || {};
+apiRouter.post("/register", async (req, res) => {
+  try {
+    await ensureDbInitialized();
+    const { nome, turma, dataVisita } = req.body || {};
 
-      // Validate name
-      if (!nome || typeof nome !== "string") {
-        return res.status(400).json({ error: "O nome é obrigatório." });
-      }
+    // Validate name
+    if (!nome || typeof nome !== "string") {
+      return res.status(400).json({ error: "O nome é obrigatório." });
+    }
 
-      const trimmedName = nome.trim().replace(/\s+/g, " ");
-      const nameParts = trimmedName.split(" ").filter((p) => p.length >= 2);
+    const trimmedName = nome.trim().replace(/\s+/g, " ");
+    const nameParts = trimmedName.split(" ").filter((p) => p.length >= 2);
 
-      if (nameParts.length < 2) {
-        return res.status(400).json({
-          error: "Por favor, informe seu primeiro e último nome (pelo menos dois nomes).",
-        });
-      }
-
-      // Validate turma
-      const validTurmas: Turma[] = ["3º BIOTEC", "3º A INFO", "3º B INFO"];
-      if (!turma || !validTurmas.includes(turma as Turma)) {
-        return res.status(400).json({ error: "Selecione uma turma válida." });
-      }
-
-      // Validate dataVisita
-      const validDatas: DataVisita[] = ["15/08", "29/08"];
-      if (!dataVisita || !validDatas.includes(dataVisita as DataVisita)) {
-        return res.status(400).json({ error: "Selecione uma data válida para a visita." });
-      }
-
-      const { registrations } = await getAllRegistrations();
-
-      // Check capacity for chosen date
-      const dateCount = registrations.filter((r) => r.dataVisita === dataVisita).length;
-      if (dateCount >= MAX_SPOTS_PER_DATE) {
-        return res.status(400).json({
-          error: "Não há mais vagas para esta data.",
-        });
-      }
-
-      // Check duplicate: same name (case insensitive) and same turma
-      const isDuplicate = registrations.some(
-        (r) =>
-          r.nome.trim().toLowerCase() === trimmedName.toLowerCase() &&
-          r.turma === turma
-      );
-
-      if (isDuplicate) {
-        return res.status(400).json({
-          error: `Já existe uma inscrição cadastrada para "${trimmedName}" na turma ${turma}.`,
-        });
-      }
-
-      // Create registration
-      const newRegistration: Registration = {
-        id: "reg_" + Date.now() + "_" + Math.random().toString(36).substring(2, 7),
-        nome: trimmedName,
-        turma: turma as Turma,
-        dataVisita: dataVisita as DataVisita,
-        createdAt: new Date().toISOString(),
-      };
-
-      // Save to local SQLite
-      if (db) {
-        try {
-          db.run(
-            "INSERT INTO registrations (id, nome, turma, dataVisita, createdAt) VALUES (?, ?, ?, ?, ?)",
-            [
-              newRegistration.id,
-              newRegistration.nome,
-              newRegistration.turma,
-              newRegistration.dataVisita,
-              newRegistration.createdAt,
-            ]
-          );
-          saveDbToDisk();
-        } catch (sqErr) {
-          console.error("Local SQLite insert error:", sqErr);
-        }
-      }
-
-      // Insert into Supabase
-      try {
-        const supRes = await insertToSupabase(newRegistration);
-        if (supRes.success) {
-          console.log("Supabase insert successful (" + supRes.method + "):", newRegistration.id);
-        } else {
-          console.warn("Supabase insert notice:", supRes.error);
-        }
-      } catch (err) {
-        console.warn("Supabase insert exception notice:", err);
-      }
-
-      const { registrations: updatedRegistrations } = await getAllRegistrations();
-      const stats = computeStats(updatedRegistrations);
-
-      return res.status(201).json({
-        success: true,
-        registration: newRegistration,
-        stats,
+    if (nameParts.length < 2) {
+      return res.status(400).json({
+        error: "Por favor, informe seu primeiro e último nome (pelo menos dois nomes).",
       });
-    } catch (err: any) {
-      console.error("Error in /api/register:", err);
-      return res.status(500).json({ error: err?.message || "Ocorreu um erro interno no servidor ao processar a inscrição." });
-    }
-  });
-
-  app.post("/api/admin/login", (req, res) => {
-    const { password } = req.body;
-    if (password === ADMIN_PASSWORD) {
-      return res.json({ success: true, message: "Acesso autorizado." });
-    } else {
-      return res.status(401).json({ error: "Senha incorreta. Tente novamente." });
-    }
-  });
-
-  app.put("/api/admin/registrations/:id", async (req, res) => {
-    const { password, dataVisita, turma, nome } = req.body;
-    if (password !== ADMIN_PASSWORD) {
-      return res.status(401).json({ error: "Não autorizado." });
     }
 
-    const { id } = req.params;
+    // Validate turma
+    const validTurmas: Turma[] = ["3º BIOTEC", "3º A INFO", "3º B INFO"];
+    if (!turma || !validTurmas.includes(turma as Turma)) {
+      return res.status(400).json({ error: "Selecione uma turma válida." });
+    }
+
+    // Validate dataVisita
+    const validDatas: DataVisita[] = ["15/08", "29/08"];
+    if (!dataVisita || !validDatas.includes(dataVisita as DataVisita)) {
+      return res.status(400).json({ error: "Selecione uma data válida para a visita." });
+    }
+
     const { registrations } = await getAllRegistrations();
 
-    const currentReg = registrations.find((r) => r.id === id);
-
-    if (!currentReg) {
-      return res.status(404).json({ error: "Inscrição não encontrada." });
+    // Check capacity for chosen date
+    const dateCount = registrations.filter((r) => r.dataVisita === dataVisita).length;
+    if (dateCount >= MAX_SPOTS_PER_DATE) {
+      return res.status(400).json({
+        error: "Não há mais vagas para esta data.",
+      });
     }
 
-    let newDate = currentReg.dataVisita;
-    let newTurma = currentReg.turma;
-    let newNome = currentReg.nome;
-
-    // If dataVisita is changing, check target date capacity
-    if (dataVisita && dataVisita !== currentReg.dataVisita) {
-      const validDatas: DataVisita[] = ["15/08", "29/08"];
-      if (!validDatas.includes(dataVisita as DataVisita)) {
-        return res.status(400).json({ error: "Data de visita inválida." });
-      }
-      const dateCount = registrations.filter((r) => r.dataVisita === dataVisita).length;
-      if (dateCount >= MAX_SPOTS_PER_DATE) {
-        return res.status(400).json({ error: `A data ${dataVisita} já atingiu o limite de ${MAX_SPOTS_PER_DATE} vagas.` });
-      }
-      newDate = dataVisita as DataVisita;
-    }
-
-    if (turma) {
-      const validTurmas: Turma[] = ["3º BIOTEC", "3º A INFO", "3º B INFO"];
-      if (validTurmas.includes(turma as Turma)) {
-        newTurma = turma as Turma;
-      }
-    }
-
-    if (nome && typeof nome === "string") {
-      const trimmed = nome.trim().replace(/\s+/g, " ");
-      if (trimmed.length > 0) {
-        newNome = trimmed;
-      }
-    }
-
-    // Update SQLite
-    db.run(
-      "UPDATE registrations SET nome = ?, turma = ?, dataVisita = ? WHERE id = ?",
-      [newNome, newTurma, newDate, id]
+    // Check duplicate: same name (case insensitive) and same turma
+    const isDuplicate = registrations.some(
+      (r) =>
+        r.nome.trim().toLowerCase() === trimmedName.toLowerCase() &&
+        r.turma === turma
     );
-    saveDbToDisk();
 
-    // Update Supabase
-    try {
-      const res1 = await supabase
-        .from("registrations")
-        .update({ nome: newNome, turma: newTurma, dataVisita: newDate })
-        .eq("id", id);
-      if (res1.error) {
-        const res2 = await supabase
-          .from("registrations")
-          .update({ nome: newNome, turma: newTurma, data_visita: newDate })
-          .eq("id", id);
-        if (res2.error) {
-          await supabase
-            .from("registrations")
-            .update({ nome: newNome, turma: newTurma, datavisita: newDate })
-            .eq("id", id);
-        }
-      }
-    } catch (err) {
-      console.warn("Supabase update exception:", err);
+    if (isDuplicate) {
+      return res.status(400).json({
+        error: `Já existe uma inscrição cadastrada para "${trimmedName}" na turma ${turma}.`,
+      });
     }
 
-    const { registrations: updatedRegistrations } = await getAllRegistrations();
+    // Create registration
+    const newRegistration: Registration = {
+      id: "reg_" + Date.now() + "_" + Math.random().toString(36).substring(2, 7),
+      nome: trimmedName,
+      turma: turma as Turma,
+      dataVisita: dataVisita as DataVisita,
+      createdAt: new Date().toISOString(),
+    };
 
-    return res.json({
-      success: true,
-      registrations: updatedRegistrations,
-      stats: computeStats(updatedRegistrations),
-    });
-  });
-
-  app.delete("/api/admin/registrations/:id", async (req, res) => {
-    const password = req.body?.password || req.headers['x-admin-password'] || req.query?.password;
-    if (password && password !== ADMIN_PASSWORD && password !== "") {
-      return res.status(401).json({ error: "Não autorizado." });
-    }
-
-    const { id } = req.params;
-
-    // Delete from SQLite local DB
-    try {
-      if (db) {
-        db.run("DELETE FROM registrations WHERE id = ?", [id]);
+    // Save to local SQLite
+    if (db) {
+      try {
+        db.run(
+          "INSERT INTO registrations (id, nome, turma, dataVisita, createdAt) VALUES (?, ?, ?, ?, ?)",
+          [
+            newRegistration.id,
+            newRegistration.nome,
+            newRegistration.turma,
+            newRegistration.dataVisita,
+            newRegistration.createdAt,
+          ]
+        );
         saveDbToDisk();
+      } catch (sqErr) {
+        console.error("Local SQLite insert error:", sqErr);
       }
-    } catch (e) {
-      console.error("SQLite delete error:", e);
     }
 
-    // Delete from Supabase
+    // Insert into Supabase
     try {
-      const { error } = await supabase.from("registrations").delete().eq("id", id);
-      if (error) {
-        console.warn("Supabase delete notice:", error.message);
+      const supRes = await insertToSupabase(newRegistration);
+      if (supRes.success) {
+        console.log("Supabase insert successful (" + supRes.method + "):", newRegistration.id);
       } else {
-        console.log("Deleted from Supabase:", id);
+        console.warn("Supabase insert notice:", supRes.error);
       }
     } catch (err) {
-      console.warn("Supabase delete exception:", err);
+      console.warn("Supabase insert exception notice:", err);
     }
 
     const { registrations: updatedRegistrations } = await getAllRegistrations();
     const stats = computeStats(updatedRegistrations);
 
-    return res.json({
+    return res.status(201).json({
       success: true,
-      registrations: updatedRegistrations,
+      registration: newRegistration,
       stats,
     });
-  });
+  } catch (err: any) {
+    console.error("Error in /api/register:", err);
+    return res.status(500).json({ error: err?.message || "Ocorreu um erro interno no servidor ao processar a inscrição." });
+  }
+});
 
-  app.post("/api/admin/reset", async (req, res) => {
-    const password = req.body?.password || req.headers['x-admin-password'] || req.query?.password;
-    if (password && password !== ADMIN_PASSWORD && password !== "") {
-      return res.status(401).json({ error: "Não autorizado." });
+apiRouter.post("/admin/login", (req, res) => {
+  const { password } = req.body;
+  if (password === ADMIN_PASSWORD) {
+    return res.json({ success: true, message: "Acesso autorizado." });
+  } else {
+    return res.status(401).json({ error: "Senha incorreta. Tente novamente." });
+  }
+});
+
+apiRouter.put("/admin/registrations/:id", async (req, res) => {
+  await ensureDbInitialized();
+  const { password, dataVisita, turma, nome } = req.body;
+  if (password !== ADMIN_PASSWORD) {
+    return res.status(401).json({ error: "Não autorizado." });
+  }
+
+  const { id } = req.params;
+  const { registrations } = await getAllRegistrations();
+
+  const currentReg = registrations.find((r) => r.id === id);
+
+  if (!currentReg) {
+    return res.status(404).json({ error: "Inscrição não encontrada." });
+  }
+
+  let newDate = currentReg.dataVisita;
+  let newTurma = currentReg.turma;
+  let newNome = currentReg.nome;
+
+  // If dataVisita is changing, check target date capacity
+  if (dataVisita && dataVisita !== currentReg.dataVisita) {
+    const validDatas: DataVisita[] = ["15/08", "29/08"];
+    if (!validDatas.includes(dataVisita as DataVisita)) {
+      return res.status(400).json({ error: "Data de visita inválida." });
     }
+    const dateCount = registrations.filter((r) => r.dataVisita === dataVisita).length;
+    if (dateCount >= MAX_SPOTS_PER_DATE) {
+      return res.status(400).json({ error: `A data ${dataVisita} já atingiu o limite de ${MAX_SPOTS_PER_DATE} vagas.` });
+    }
+    newDate = dataVisita as DataVisita;
+  }
 
-    // Reset SQLite
+  if (turma) {
+    const validTurmas: Turma[] = ["3º BIOTEC", "3º A INFO", "3º B INFO"];
+    if (validTurmas.includes(turma as Turma)) {
+      newTurma = turma as Turma;
+    }
+  }
+
+  if (nome && typeof nome === "string") {
+    const trimmed = nome.trim().replace(/\s+/g, " ");
+    if (trimmed.length > 0) {
+      newNome = trimmed;
+    }
+  }
+
+  // Update SQLite
+  if (db) {
     try {
-      if (db) {
-        db.run("DELETE FROM registrations");
-        saveDbToDisk();
-      }
+      db.run(
+        "UPDATE registrations SET nome = ?, turma = ?, dataVisita = ? WHERE id = ?",
+        [newNome, newTurma, newDate, id]
+      );
+      saveDbToDisk();
     } catch (e) {
-      console.error("SQLite reset error:", e);
+      // ignore
     }
+  }
 
-    // Reset Supabase
-    try {
-      await supabase.from("registrations").delete().neq("id", "0");
-    } catch (err) {
-      console.warn("Supabase reset exception:", err);
+  // Update Supabase
+  try {
+    const res1 = await supabase
+      .from("registrations")
+      .update({ nome: newNome, turma: newTurma, dataVisita: newDate })
+      .eq("id", id);
+    if (res1.error) {
+      const res2 = await supabase
+        .from("registrations")
+        .update({ nome: newNome, turma: newTurma, data_visita: newDate })
+        .eq("id", id);
+      if (res2.error) {
+        await supabase
+          .from("registrations")
+          .update({ nome: newNome, turma: newTurma, datavisita: newDate })
+          .eq("id", id);
+      }
     }
+  } catch (err) {
+    console.warn("Supabase update exception:", err);
+  }
 
-    const { registrations: updatedRegistrations } = await getAllRegistrations();
-    const stats = computeStats(updatedRegistrations);
+  const { registrations: updatedRegistrations } = await getAllRegistrations();
 
-    return res.json({
-      success: true,
-      registrations: updatedRegistrations,
-      stats,
-    });
+  return res.json({
+    success: true,
+    registrations: updatedRegistrations,
+    stats: computeStats(updatedRegistrations),
   });
+});
+
+apiRouter.delete("/admin/registrations/:id", async (req, res) => {
+  await ensureDbInitialized();
+  const password = req.body?.password || req.headers['x-admin-password'] || req.query?.password;
+  if (password && password !== ADMIN_PASSWORD && password !== "") {
+    return res.status(401).json({ error: "Não autorizado." });
+  }
+
+  const { id } = req.params;
+
+  // Delete from SQLite local DB
+  try {
+    if (db) {
+      db.run("DELETE FROM registrations WHERE id = ?", [id]);
+      saveDbToDisk();
+    }
+  } catch (e) {
+    console.error("SQLite delete error:", e);
+  }
+
+  // Delete from Supabase
+  try {
+    const { error } = await supabase.from("registrations").delete().eq("id", id);
+    if (error) {
+      console.warn("Supabase delete notice:", error.message);
+    } else {
+      console.log("Deleted from Supabase:", id);
+    }
+  } catch (err) {
+    console.warn("Supabase delete exception:", err);
+  }
+
+  const { registrations: updatedRegistrations } = await getAllRegistrations();
+  const stats = computeStats(updatedRegistrations);
+
+  return res.json({
+    success: true,
+    registrations: updatedRegistrations,
+    stats,
+  });
+});
+
+apiRouter.post("/admin/reset", async (req, res) => {
+  await ensureDbInitialized();
+  const password = req.body?.password || req.headers['x-admin-password'] || req.query?.password;
+  if (password && password !== ADMIN_PASSWORD && password !== "") {
+    return res.status(401).json({ error: "Não autorizado." });
+  }
+
+  // Reset SQLite
+  try {
+    if (db) {
+      db.run("DELETE FROM registrations");
+      saveDbToDisk();
+    }
+  } catch (e) {
+    console.error("SQLite reset error:", e);
+  }
+
+  // Reset Supabase
+  try {
+    await supabase.from("registrations").delete().neq("id", "0");
+  } catch (err) {
+    console.warn("Supabase reset exception:", err);
+  }
+
+  const { registrations: updatedRegistrations } = await getAllRegistrations();
+  const stats = computeStats(updatedRegistrations);
+
+  return res.json({
+    success: true,
+    registrations: updatedRegistrations,
+    stats,
+  });
+});
+
+// Mount router under both /api and / so it works regardless of URL rewriting
+app.use("/api", apiRouter);
+app.use("/", apiRouter);
+
+async function startServer() {
+  await ensureDbInitialized();
 
   // Vite development or static production fallback
   if (process.env.NODE_ENV !== "production") {
@@ -611,4 +644,9 @@ async function startServer() {
   });
 }
 
-startServer();
+export default app;
+
+if (process.env.VERCEL !== "1") {
+  startServer();
+}
+

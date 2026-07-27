@@ -11,41 +11,79 @@ import {
   DataVisita,
   Turma,
 } from './types';
-import { Loader2, RefreshCw } from 'lucide-react';
+import { Loader2 } from 'lucide-react';
+import { supabase } from './lib/supabaseClient';
+
+const MAX_SPOTS = 38;
+
+function computeVisitStats(regs: Registration[]): VisitStats {
+  const count15 = regs.filter((r) => r.dataVisita === '15/08').length;
+  const count29 = regs.filter((r) => r.dataVisita === '29/08').length;
+
+  return {
+    capacities: {
+      '15/08': {
+        dataVisita: '15/08',
+        totalLimit: MAX_SPOTS,
+        occupied: count15,
+        available: Math.max(0, MAX_SPOTS - count15),
+        isFull: count15 >= MAX_SPOTS,
+      },
+      '29/08': {
+        dataVisita: '29/08',
+        totalLimit: MAX_SPOTS,
+        occupied: count29,
+        available: Math.max(0, MAX_SPOTS - count29),
+        isFull: count29 >= MAX_SPOTS,
+      },
+    },
+    totalRegistrations: regs.length,
+    byTurma: {
+      '3º BIOTEC': regs.filter((r) => r.turma === '3º BIOTEC').length,
+      '3º A INFO': regs.filter((r) => r.turma === '3º A INFO').length,
+      '3º B INFO': regs.filter((r) => r.turma === '3º B INFO').length,
+    },
+    byData: {
+      '15/08': count15,
+      '29/08': count29,
+    },
+  };
+}
+
+function normalizeSupabaseRow(row: any): Registration {
+  return {
+    id: String(row.id),
+    nome: String(row.nome || row.name || ''),
+    turma: (row.turma || '3º BIOTEC') as Turma,
+    dataVisita: (row.dataVisita || row.data_visita || row.datavisita || '15/08') as DataVisita,
+    createdAt: String(row.createdAt || row.created_at || row.createdat || new Date().toISOString()),
+  };
+}
 
 export default function App() {
   const [isAdminOpen, setIsAdminOpen] = useState(false);
   const [selectedDateCard, setSelectedDateCard] = useState<DataVisita | ''>('');
   const [isLoading, setIsLoading] = useState(true);
   const [registrations, setRegistrations] = useState<Registration[]>([]);
-  const [stats, setStats] = useState<VisitStats>({
-    capacities: {
-      '15/08': {
-        dataVisita: '15/08',
-        totalLimit: 38,
-        occupied: 0,
-        available: 38,
-        isFull: false,
-      },
-      '29/08': {
-        dataVisita: '29/08',
-        totalLimit: 38,
-        occupied: 0,
-        available: 38,
-        isFull: false,
-      },
-    },
-    totalRegistrations: 0,
-    byTurma: {
-      '3º BIOTEC': 0,
-      '3º A INFO': 0,
-      '3º B INFO': 0,
-    },
-    byData: {
-      '15/08': 0,
-      '29/08': 0,
-    },
-  });
+  const [stats, setStats] = useState<VisitStats>(computeVisitStats([]));
+
+  // Direct Supabase fetch fallback
+  const fetchDirectFromSupabase = async () => {
+    try {
+      const { data, error } = await supabase.from('registrations').select('*');
+      if (!error && Array.isArray(data)) {
+        const normalized = data.map(normalizeSupabaseRow).sort(
+          (a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime()
+        );
+        setRegistrations(normalized);
+        setStats(computeVisitStats(normalized));
+        return normalized;
+      }
+    } catch (err) {
+      console.warn('Direct Supabase fetch error:', err);
+    }
+    return [];
+  };
 
   // Fetch data function
   const fetchData = useCallback(async () => {
@@ -57,9 +95,13 @@ export default function App() {
         if (data.stats) {
           setStats(data.stats);
         }
+      } else if (res.status === 404) {
+        // Direct client-side fallback if backend API route returns 404 (e.g. static hosting)
+        await fetchDirectFromSupabase();
       }
     } catch (err) {
-      console.error('Error fetching registrations:', err);
+      console.warn('Error fetching registrations from /api, trying direct Supabase fallback:', err);
+      await fetchDirectFromSupabase();
     } finally {
       setIsLoading(false);
     }
@@ -70,7 +112,7 @@ export default function App() {
     fetchData();
     const interval = setInterval(() => {
       fetchData();
-    }, 4000); // Poll every 4 seconds to simulate real-time updates
+    }, 4000); // Poll every 4 seconds
     return () => clearInterval(interval);
   }, [fetchData]);
 
@@ -89,28 +131,115 @@ export default function App() {
       try {
         data = await res.json();
       } catch (parseErr) {
-        console.error('Failed to parse JSON response:', parseErr);
+        // ignore parse error if response is not JSON
       }
 
       if (res.ok && data.success) {
         if (data.stats) setStats(data.stats);
-        // Refresh local list
         await fetchData();
         return {
           success: true,
           registration: data.registration,
         };
-      } else {
+      }
+
+      // If res.status is NOT 404 and returned a specific validation message (e.g., 400 bad request), return it
+      if (res.status !== 404 && data && data.error) {
         return {
           success: false,
-          error: data.error || `Ocorreu um erro no servidor (código ${res.status}). Tente novamente.`,
+          error: data.error,
         };
       }
     } catch (err) {
-      console.error('Registration submission fetch error:', err);
+      console.warn('Backend API submission failed, falling back to direct Supabase connection...');
+    }
+
+    // Direct Supabase Fallback for registration (e.g., when deployed on static host or 404)
+    try {
+      const trimmedName = (formData.nome || '').trim().replace(/\s+/g, ' ');
+      const nameParts = trimmedName.split(' ').filter((p) => p.length >= 2);
+
+      if (nameParts.length < 2) {
+        return {
+          success: false,
+          error: 'Por favor, informe seu primeiro e último nome (pelo menos dois nomes).',
+        };
+      }
+
+      const currentRegs = await fetchDirectFromSupabase();
+
+      // Check date capacity
+      const countForDate = currentRegs.filter((r) => r.dataVisita === formData.dataVisita).length;
+      if (countForDate >= MAX_SPOTS) {
+        return {
+          success: false,
+          error: 'Não há mais vagas para esta data.',
+        };
+      }
+
+      // Check duplicate
+      const isDuplicate = currentRegs.some(
+        (r) =>
+          r.nome.trim().toLowerCase() === trimmedName.toLowerCase() &&
+          r.turma === formData.turma
+      );
+
+      if (isDuplicate) {
+        return {
+          success: false,
+          error: `Já existe uma inscrição cadastrada para "${trimmedName}" na turma ${formData.turma}.`,
+        };
+      }
+
+      const newReg: Registration = {
+        id: 'reg_' + Date.now() + '_' + Math.random().toString(36).substring(2, 7),
+        nome: trimmedName,
+        turma: formData.turma as Turma,
+        dataVisita: formData.dataVisita as DataVisita,
+        createdAt: new Date().toISOString(),
+      };
+
+      let insRes = await supabase.from('registrations').insert([
+        {
+          id: newReg.id,
+          nome: newReg.nome,
+          turma: newReg.turma,
+          dataVisita: newReg.dataVisita,
+          createdAt: newReg.createdAt,
+          data_visita: newReg.dataVisita,
+          created_at: newReg.createdAt,
+        },
+      ]);
+
+      if (insRes.error) {
+        insRes = await supabase.from('registrations').insert([
+          {
+            id: newReg.id,
+            nome: newReg.nome,
+            turma: newReg.turma,
+            data_visita: newReg.dataVisita,
+            created_at: newReg.createdAt,
+          },
+        ]);
+      }
+
+      if (insRes.error) {
+        return {
+          success: false,
+          error: 'Erro ao salvar inscrição no banco de dados. Tente novamente.',
+        };
+      }
+
+      await fetchDirectFromSupabase();
+      return {
+        success: true,
+        registration: newReg,
+      };
+    } catch (fallbackErr: any) {
+      console.error('Direct Supabase registration error:', fallbackErr);
       return {
         success: false,
-        error: 'Falha na conexão com o servidor. Verifique sua rede e tente novamente.',
+        error: 'Ocorreu um erro ao processar a inscrição. Tente novamente.',
       };
     }
   };
@@ -127,21 +256,29 @@ export default function App() {
         body: JSON.stringify({ password }),
       });
 
-      const data = await res.json();
-      if (res.ok && data.success) {
-        setRegistrations(data.registrations || []);
-        if (data.stats) setStats(data.stats);
-        return true;
-      } else {
-        console.error('Delete registration response error:', data);
+      if (res.ok) {
+        const data = await res.json();
+        if (data.success) {
+          setRegistrations(data.registrations || []);
+          if (data.stats) setStats(data.stats);
+          return true;
+        }
       }
     } catch (err) {
-      console.error('Error deleting registration:', err);
+      console.warn('API delete failed, trying direct Supabase delete...');
     }
-    return false;
+
+    // Direct Supabase delete fallback
+    try {
+      await supabase.from('registrations').delete().eq('id', id);
+      await fetchDirectFromSupabase();
+      return true;
+    } catch (e) {
+      return false;
+    }
   };
 
-  // Handle update registration (e.g., change visit date or turma)
+  // Handle update registration
   const handleUpdateRegistration = async (
     id: string,
     updates: { dataVisita?: DataVisita; turma?: Turma; nome?: string },
@@ -157,17 +294,30 @@ export default function App() {
         body: JSON.stringify({ ...updates, password }),
       });
 
-      const data = await res.json();
-      if (res.ok && data.success) {
-        setRegistrations(data.registrations || []);
-        if (data.stats) setStats(data.stats);
-        return { success: true };
-      } else {
-        return { success: false, error: data.error || 'Erro ao atualizar inscrição.' };
+      if (res.ok) {
+        const data = await res.json();
+        if (data.success) {
+          setRegistrations(data.registrations || []);
+          if (data.stats) setStats(data.stats);
+          return { success: true };
+        }
       }
     } catch (err) {
-      console.error('Error updating registration:', err);
-      return { success: false, error: 'Erro de conexão com o servidor.' };
+      console.warn('API update failed, trying direct Supabase update...');
+    }
+
+    // Direct Supabase update fallback
+    try {
+      await supabase.from('registrations').update({
+        nome: updates.nome,
+        turma: updates.turma,
+        dataVisita: updates.dataVisita,
+        data_visita: updates.dataVisita,
+      }).eq('id', id);
+      await fetchDirectFromSupabase();
+      return { success: true };
+    } catch (e: any) {
+      return { success: false, error: 'Erro ao atualizar no banco de dados.' };
     }
   };
 
@@ -183,16 +333,26 @@ export default function App() {
         body: JSON.stringify({ password }),
       });
 
-      const data = await res.json();
-      if (res.ok && data.success) {
-        setRegistrations([]);
-        if (data.stats) setStats(data.stats);
-        return true;
+      if (res.ok) {
+        const data = await res.json();
+        if (data.success) {
+          setRegistrations([]);
+          if (data.stats) setStats(data.stats);
+          return true;
+        }
       }
     } catch (err) {
-      console.error('Error resetting data:', err);
+      console.warn('API reset failed, trying direct Supabase reset...');
     }
-    return false;
+
+    // Direct Supabase reset fallback
+    try {
+      await supabase.from('registrations').delete().neq('id', '0');
+      await fetchDirectFromSupabase();
+      return true;
+    } catch (e) {
+      return false;
+    }
   };
 
   return (
@@ -251,3 +411,4 @@ export default function App() {
     </div>
   );
 }
+

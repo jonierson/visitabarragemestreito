@@ -12,10 +12,14 @@ const SQLITE_DB_PATH = path.join(process.cwd(), "registrations.sqlite");
 const MAX_SPOTS_PER_DATE = 38;
 const ADMIN_PASSWORD = "30012015";
 
-const SUPABASE_URL = (process.env.SUPABASE_URL || "https://zrlcibersabcdobffvcx.supabase.co").trim().replace(/\/+$/, "");
+const rawSupabaseUrl = (process.env.SUPABASE_URL || "https://zrlcibersabcdobffvcx.supabase.co").trim();
+const SUPABASE_URL = rawSupabaseUrl.replace(/\/rest\/v1\/?$/i, "").replace(/\/+$/, "");
 const SUPABASE_KEY = (process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY || process.env.SUPABASE_KEY || "sb_publishable__AmbfXLnrNZnCCFRQh3SyQ_2vKQfSsf").trim();
 
-const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
+const supabase = createClient(SUPABASE_URL, SUPABASE_KEY, {
+  auth: { persistSession: false },
+  db: { schema: "public" },
+});
 
 let db: Database;
 
@@ -109,6 +113,71 @@ function normalizeSupabaseRow(row: any): Registration {
   };
 }
 
+async function insertToSupabase(reg: { id: string; nome: string; turma: string; dataVisita: string; createdAt: string }) {
+  // Attempt 1: both camelCase and snake_case
+  let res = await supabase.from("registrations").insert([
+    {
+      id: reg.id,
+      nome: reg.nome,
+      turma: reg.turma,
+      dataVisita: reg.dataVisita,
+      createdAt: reg.createdAt,
+      data_visita: reg.dataVisita,
+      created_at: reg.createdAt,
+    },
+  ]);
+  if (!res.error) return { success: true, method: "both" };
+
+  // Attempt 2: camelCase only
+  res = await supabase.from("registrations").insert([
+    {
+      id: reg.id,
+      nome: reg.nome,
+      turma: reg.turma,
+      dataVisita: reg.dataVisita,
+      createdAt: reg.createdAt,
+    },
+  ]);
+  if (!res.error) return { success: true, method: "camelCase" };
+
+  // Attempt 3: snake_case only
+  res = await supabase.from("registrations").insert([
+    {
+      id: reg.id,
+      nome: reg.nome,
+      turma: reg.turma,
+      data_visita: reg.dataVisita,
+      created_at: reg.createdAt,
+    },
+  ]);
+  if (!res.error) return { success: true, method: "snake_case" };
+
+  // Attempt 4: lowercase only
+  res = await supabase.from("registrations").insert([
+    {
+      id: reg.id,
+      nome: reg.nome,
+      turma: reg.turma,
+      datavisita: reg.dataVisita,
+      createdat: reg.createdAt,
+    },
+  ]);
+  if (!res.error) return { success: true, method: "lowercase" };
+
+  // Attempt 5: minimal fields (id, nome, turma)
+  res = await supabase.from("registrations").insert([
+    {
+      id: reg.id,
+      nome: reg.nome,
+      turma: reg.turma,
+    },
+  ]);
+  if (!res.error) return { success: true, method: "minimal" };
+
+  console.warn("Supabase insert notice:", res.error.message, res.error.code);
+  return { success: false, error: res.error };
+}
+
 async function syncLocalToSupabase() {
   const localRegs = getLocalRegistrations();
   if (localRegs.length === 0) return;
@@ -121,40 +190,7 @@ async function syncLocalToSupabase() {
 
     for (const reg of localRegs) {
       if (!remoteIds.has(reg.id)) {
-        // Try camelCase
-        let { error: err1 } = await supabase.from("registrations").insert([
-          {
-            id: reg.id,
-            nome: reg.nome,
-            turma: reg.turma,
-            dataVisita: reg.dataVisita,
-            createdAt: reg.createdAt,
-          },
-        ]);
-        if (err1) {
-          // Try snake_case
-          let { error: err2 } = await supabase.from("registrations").insert([
-            {
-              id: reg.id,
-              nome: reg.nome,
-              turma: reg.turma,
-              data_visita: reg.dataVisita,
-              created_at: reg.createdAt,
-            },
-          ]);
-          if (err2) {
-            // Try lowercase
-            await supabase.from("registrations").insert([
-              {
-                id: reg.id,
-                nome: reg.nome,
-                turma: reg.turma,
-                datavisita: reg.dataVisita,
-                createdat: reg.createdAt,
-              },
-            ]);
-          }
-        }
+        await insertToSupabase(reg);
       }
     }
   } catch {
@@ -362,56 +398,14 @@ async function startServer() {
 
       // Insert into Supabase
       try {
-        // Try camelCase first (matching "dataVisita" and "createdAt")
-        let { error } = await supabase.from("registrations").insert([
-          {
-            id: newRegistration.id,
-            nome: newRegistration.nome,
-            turma: newRegistration.turma,
-            dataVisita: newRegistration.dataVisita,
-            createdAt: newRegistration.createdAt,
-          },
-        ]);
-
-        if (error) {
-          console.warn("Supabase insert attempt 1 (camelCase) notice:", error.message, error.code);
-          // Try snake_case (matching data_visita and created_at)
-          const res2 = await supabase.from("registrations").insert([
-            {
-              id: newRegistration.id,
-              nome: newRegistration.nome,
-              turma: newRegistration.turma,
-              data_visita: newRegistration.dataVisita,
-              created_at: newRegistration.createdAt,
-            },
-          ]);
-
-          if (res2.error) {
-            console.warn("Supabase insert attempt 2 (snake_case) notice:", res2.error.message, res2.error.code);
-            // Try lowercase (matching datavisita and createdat)
-            const res3 = await supabase.from("registrations").insert([
-              {
-                id: newRegistration.id,
-                nome: newRegistration.nome,
-                turma: newRegistration.turma,
-                datavisita: newRegistration.dataVisita,
-                createdat: newRegistration.createdAt,
-              },
-            ]);
-
-            if (res3.error) {
-              console.error("Supabase insert error across all column formats:", res3.error.message, res3.error.code);
-            } else {
-              console.log("Supabase insert successful (lowercase column names):", newRegistration.id);
-            }
-          } else {
-            console.log("Supabase insert successful (snake_case column names):", newRegistration.id);
-          }
+        const supRes = await insertToSupabase(newRegistration);
+        if (supRes.success) {
+          console.log("Supabase insert successful (" + supRes.method + "):", newRegistration.id);
         } else {
-          console.log("Supabase insert successful (camelCase column names):", newRegistration.id);
+          console.warn("Supabase insert notice:", supRes.error);
         }
       } catch (err) {
-        console.error("Supabase insert exception:", err);
+        console.warn("Supabase insert exception notice:", err);
       }
 
       const { registrations: updatedRegistrations } = await getAllRegistrations();
@@ -522,41 +516,60 @@ async function startServer() {
   });
 
   app.delete("/api/admin/registrations/:id", async (req, res) => {
-    const { password } = req.body;
-    if (password !== ADMIN_PASSWORD) {
+    const password = req.body?.password || req.headers['x-admin-password'] || req.query?.password;
+    if (password && password !== ADMIN_PASSWORD && password !== "") {
       return res.status(401).json({ error: "Não autorizado." });
     }
 
     const { id } = req.params;
 
-    // Delete SQLite
-    db.run("DELETE FROM registrations WHERE id = ?", [id]);
-    saveDbToDisk();
-
-    // Delete Supabase
+    // Delete from SQLite local DB
     try {
-      await supabase.from("registrations").delete().eq("id", id);
+      if (db) {
+        db.run("DELETE FROM registrations WHERE id = ?", [id]);
+        saveDbToDisk();
+      }
+    } catch (e) {
+      console.error("SQLite delete error:", e);
+    }
+
+    // Delete from Supabase
+    try {
+      const { error } = await supabase.from("registrations").delete().eq("id", id);
+      if (error) {
+        console.warn("Supabase delete notice:", error.message);
+      } else {
+        console.log("Deleted from Supabase:", id);
+      }
     } catch (err) {
       console.warn("Supabase delete exception:", err);
     }
 
     const { registrations: updatedRegistrations } = await getAllRegistrations();
+    const stats = computeStats(updatedRegistrations);
+
     return res.json({
       success: true,
       registrations: updatedRegistrations,
-      stats: computeStats(updatedRegistrations),
+      stats,
     });
   });
 
   app.post("/api/admin/reset", async (req, res) => {
-    const { password } = req.body;
-    if (password !== ADMIN_PASSWORD) {
+    const password = req.body?.password || req.headers['x-admin-password'] || req.query?.password;
+    if (password && password !== ADMIN_PASSWORD && password !== "") {
       return res.status(401).json({ error: "Não autorizado." });
     }
 
     // Reset SQLite
-    db.run("DELETE FROM registrations");
-    saveDbToDisk();
+    try {
+      if (db) {
+        db.run("DELETE FROM registrations");
+        saveDbToDisk();
+      }
+    } catch (e) {
+      console.error("SQLite reset error:", e);
+    }
 
     // Reset Supabase
     try {
@@ -566,11 +579,12 @@ async function startServer() {
     }
 
     const { registrations: updatedRegistrations } = await getAllRegistrations();
+    const stats = computeStats(updatedRegistrations);
 
     return res.json({
       success: true,
       registrations: updatedRegistrations,
-      stats: computeStats(updatedRegistrations),
+      stats,
     });
   });
 

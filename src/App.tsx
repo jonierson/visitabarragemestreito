@@ -116,14 +116,15 @@ export default function App() {
   };
 
   // Handle delete registration
-  const handleDeleteRegistration = async (id: string, adminPass: string = '30012015'): Promise<boolean> => {
+  const handleDeleteRegistration = async (id: string, adminPass?: string): Promise<boolean> => {
+    const password = adminPass || '30012015';
     try {
       const res = await fetch(`/api/admin/registrations/${id}`, {
         method: 'DELETE',
         headers: {
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({ password: adminPass }),
+        body: JSON.stringify({ password }),
       });
 
       const data = await res.json();
@@ -131,6 +132,8 @@ export default function App() {
         setRegistrations(data.registrations || []);
         if (data.stats) setStats(data.stats);
         return true;
+      } else {
+        console.error('Delete registration response error:', data);
       }
     } catch (err) {
       console.error('Error deleting registration:', err);
@@ -142,15 +145,16 @@ export default function App() {
   const handleUpdateRegistration = async (
     id: string,
     updates: { dataVisita?: DataVisita; turma?: Turma; nome?: string },
-    adminPass: string = '30012015'
+    adminPass?: string
   ): Promise<{ success: boolean; error?: string }> => {
+    const password = adminPass || '30012015';
     try {
       const res = await fetch(`/api/admin/registrations/${id}`, {
         method: 'PUT',
         headers: {
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({ ...updates, password: adminPass }),
+        body: JSON.stringify({ ...updates, password }),
       });
 
       const data = await res.json();
@@ -168,14 +172,15 @@ export default function App() {
   };
 
   // Handle reset registrations
-  const handleResetData = async (adminPass: string = '30012015'): Promise<boolean> => {
+  const handleResetData = async (adminPass?: string): Promise<boolean> => {
+    const password = adminPass || '30012015';
     try {
       const res = await fetch('/api/admin/reset', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({ password: adminPass }),
+        body: JSON.stringify({ password }),
       });
 
       const data = await res.json();

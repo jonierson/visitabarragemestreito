@@ -42,6 +42,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
   onResetData,
 }) => {
   const [passwordInput, setPasswordInput] = useState('');
+  const [savedPassword, setSavedPassword] = useState('30012015');
   const [isAuthenticated, setIsAuthenticated] = useState(false);
   const [authError, setAuthError] = useState<string | null>(null);
   const [isLoggingIn, setIsLoggingIn] = useState(false);
@@ -88,6 +89,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
 
       if (res.ok && data.success) {
         setIsAuthenticated(true);
+        setSavedPassword(passwordInput || '30012015');
         setPasswordInput('');
       } else {
         setAuthError(data.error || 'Senha incorreta.');
@@ -194,15 +196,27 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
   const confirmDelete = async () => {
     if (!deleteId) return;
     setIsDeleting(true);
-    await onDeleteRegistration(deleteId, passwordInput);
+    const passToUse = savedPassword || passwordInput || '30012015';
+    const success = await onDeleteRegistration(deleteId, passToUse);
     setIsDeleting(false);
     setDeleteId(null);
+    if (success) {
+      await onRefreshData();
+    } else {
+      alert('Erro ao excluir a inscrição. Tente novamente.');
+    }
   };
 
   const handleReset = async () => {
     if (onResetData) {
-      await onResetData(passwordInput);
+      const passToUse = savedPassword || passwordInput || '30012015';
+      const success = await onResetData(passToUse);
       setShowResetConfirm(false);
+      if (success) {
+        await onRefreshData();
+      } else {
+        alert('Erro ao resetar os registros. Tente novamente.');
+      }
     }
   };
 
@@ -480,11 +494,13 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                     </td>
                     <td className="py-3.5 px-4 text-right">
                       <button
+                        type="button"
                         onClick={() => setDeleteId(reg.id)}
-                        className="p-1.5 text-slate-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition-colors cursor-pointer"
+                        className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-bold text-red-600 bg-red-50 hover:bg-red-100 hover:text-red-700 border border-red-200 rounded-lg transition-all cursor-pointer shadow-2xs"
                         title="Excluir inscrição"
                       >
-                        <Trash2 className="w-4 h-4" />
+                        <Trash2 className="w-3.5 h-3.5" />
+                        <span>Excluir</span>
                       </button>
                     </td>
                   </tr>

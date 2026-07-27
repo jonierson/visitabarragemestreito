@@ -67,53 +67,84 @@ export default function App() {
   const [registrations, setRegistrations] = useState<Registration[]>([]);
   const [stats, setStats] = useState<VisitStats>(computeVisitStats([]));
 
-  // Direct Supabase fetch fallback
-  const fetchDirectFromSupabase = async () => {
+  // Direct Supabase fetch
+  const fetchDirectFromSupabase = useCallback(async (): Promise<Registration[]> => {
     try {
       const { data, error } = await supabase.from('registrations').select('*');
       if (!error && Array.isArray(data)) {
         const normalized = data.map(normalizeSupabaseRow).sort(
           (a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime()
         );
-        setRegistrations(normalized);
-        setStats(computeVisitStats(normalized));
         return normalized;
       }
     } catch (err) {
       console.warn('Direct Supabase fetch error:', err);
     }
     return [];
-  };
+  }, []);
 
   // Fetch data function
   const fetchData = useCallback(async () => {
+    // 1. Fetch directly from Supabase first (most reliable for Vercel & static/Jamstack deployments)
+    const supaRegs = await fetchDirectFromSupabase();
+
+    if (supaRegs.length > 0) {
+      setRegistrations(supaRegs);
+      setStats(computeVisitStats(supaRegs));
+      setIsLoading(false);
+      return;
+    }
+
+    // 2. Secondary fallback: backend API
     try {
-      const res = await fetch('/api/registrations');
+      const res = await fetch(`/api/registrations?t=${Date.now()}`, {
+        headers: { 'Cache-Control': 'no-cache' },
+      });
       if (res.ok) {
         const data = await res.json();
-        setRegistrations(data.registrations || []);
-        if (data.stats) {
-          setStats(data.stats);
+        if (data.registrations && data.registrations.length > 0) {
+          setRegistrations(data.registrations);
+          if (data.stats) setStats(data.stats);
+        } else {
+          setRegistrations(supaRegs);
+          setStats(computeVisitStats(supaRegs));
         }
-      } else if (res.status === 404) {
-        // Direct client-side fallback if backend API route returns 404 (e.g. static hosting)
-        await fetchDirectFromSupabase();
+      } else {
+        setRegistrations(supaRegs);
+        setStats(computeVisitStats(supaRegs));
       }
     } catch (err) {
-      console.warn('Error fetching registrations from /api, trying direct Supabase fallback:', err);
-      await fetchDirectFromSupabase();
+      console.warn('Error fetching registrations from /api, using Supabase data:', err);
+      setRegistrations(supaRegs);
+      setStats(computeVisitStats(supaRegs));
     } finally {
       setIsLoading(false);
     }
-  }, []);
+  }, [fetchDirectFromSupabase]);
 
-  // Initial load and periodic polling for real-time updates
+  // Initial load, periodic polling, and Supabase Realtime subscription for instant updates
   useEffect(() => {
     fetchData();
+
     const interval = setInterval(() => {
       fetchData();
     }, 4000); // Poll every 4 seconds
-    return () => clearInterval(interval);
+
+    const channel = supabase
+      .channel('public:registrations')
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'registrations' },
+        () => {
+          fetchData();
+        }
+      )
+      .subscribe();
+
+    return () => {
+      clearInterval(interval);
+      supabase.removeChannel(channel);
+    };
   }, [fetchData]);
 
   // Handle new registration

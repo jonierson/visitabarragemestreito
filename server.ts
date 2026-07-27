@@ -3,6 +3,7 @@ import path from "path";
 import fs from "fs";
 import initSqlJs, { Database } from "sql.js";
 import { createServer as createViteServer } from "vite";
+import { createClient } from "@supabase/supabase-js";
 import { Registration, Turma, DataVisita, VisitStats } from "./src/types";
 
 const PORT = 3000;
@@ -10,6 +11,11 @@ const DB_FILE = path.join(process.cwd(), "registrations.json");
 const SQLITE_DB_PATH = path.join(process.cwd(), "registrations.sqlite");
 const MAX_SPOTS_PER_DATE = 38;
 const ADMIN_PASSWORD = "30012015";
+
+const SUPABASE_URL = process.env.SUPABASE_URL || "https://zrlcibersabcdobffvcx.supabase.co";
+const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY || "sb_publishable__AmbfXLnrNZnCCFRQh3SyQ_2vKQfSsf";
+
+const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
 let db: Database;
 
@@ -72,7 +78,7 @@ async function initDb(): Promise<Database> {
   return database;
 }
 
-function getAllRegistrations(): Registration[] {
+function getLocalRegistrations(): Registration[] {
   const res = db.exec("SELECT id, nome, turma, dataVisita, createdAt FROM registrations ORDER BY datetime(createdAt) ASC");
   if (!res || res.length === 0) return [];
   const columns = res[0].columns;
@@ -87,16 +93,41 @@ function getAllRegistrations(): Registration[] {
   });
 }
 
-function getRegistrationById(id: string): Registration | null {
-  const res = db.exec("SELECT id, nome, turma, dataVisita, createdAt FROM registrations WHERE id = ?", [id]);
-  if (!res || res.length === 0 || res[0].values.length === 0) return null;
-  const columns = res[0].columns;
-  const row = res[0].values[0];
-  const reg: Record<string, any> = {};
-  columns.forEach((col, idx) => {
-    reg[col] = row[idx];
-  });
-  return reg as unknown as Registration;
+function normalizeSupabaseRow(row: any): Registration {
+  return {
+    id: String(row.id),
+    nome: String(row.nome || row.name || ""),
+    turma: (row.turma || "3º BIOTEC") as Turma,
+    dataVisita: (row.dataVisita || row.data_visita || row.datavisita || "15/08") as DataVisita,
+    createdAt: String(row.createdAt || row.created_at || row.createdat || new Date().toISOString()),
+  };
+}
+
+async function getAllRegistrations(): Promise<{ registrations: Registration[]; source: string }> {
+  try {
+    const { data, error } = await supabase
+      .from("registrations")
+      .select("*");
+
+    if (!error && Array.isArray(data)) {
+      const regs = data.map(normalizeSupabaseRow);
+      // Sync to local SQLite in background
+      for (const reg of regs) {
+        db.run(
+          "INSERT OR REPLACE INTO registrations (id, nome, turma, dataVisita, createdAt) VALUES (?, ?, ?, ?, ?)",
+          [reg.id, reg.nome, reg.turma, reg.dataVisita, reg.createdAt]
+        );
+      }
+      saveDbToDisk();
+      return { registrations: regs, source: "Supabase Database" };
+    } else {
+      if (error) console.warn("Supabase query notice/error:", error.message);
+    }
+  } catch (err) {
+    console.warn("Supabase fetch exception, falling back to local SQLite:", err);
+  }
+
+  return { registrations: getLocalRegistrations(), source: "SQLite 3 (Local Backup)" };
 }
 
 function computeStats(registrations: Registration[]): VisitStats {
@@ -144,22 +175,23 @@ async function startServer() {
   app.use(express.json());
 
   // API Endpoints
-  app.get("/api/stats", (req, res) => {
-    const registrations = getAllRegistrations();
+  app.get("/api/stats", async (req, res) => {
+    const { registrations } = await getAllRegistrations();
     const stats = computeStats(registrations);
     res.json(stats);
   });
 
-  app.get("/api/registrations", (req, res) => {
-    const registrations = getAllRegistrations();
+  app.get("/api/registrations", async (req, res) => {
+    const { registrations, source } = await getAllRegistrations();
     res.json({
       registrations,
       stats: computeStats(registrations),
-      dbEngine: "SQLite 3 (sql.js)",
+      dbEngine: source,
+      supabaseConnected: source.includes("Supabase"),
     });
   });
 
-  app.post("/api/register", (req, res) => {
+  app.post("/api/register", async (req, res) => {
     const { nome, turma, dataVisita } = req.body;
 
     // Validate name
@@ -188,7 +220,7 @@ async function startServer() {
       return res.status(400).json({ error: "Selecione uma data válida para a visita." });
     }
 
-    const registrations = getAllRegistrations();
+    const { registrations } = await getAllRegistrations();
 
     // Check capacity for chosen date
     const dateCount = registrations.filter((r) => r.dataVisita === dataVisita).length;
@@ -220,6 +252,7 @@ async function startServer() {
       createdAt: new Date().toISOString(),
     };
 
+    // Save to local SQLite
     db.run(
       "INSERT INTO registrations (id, nome, turma, dataVisita, createdAt) VALUES (?, ?, ?, ?, ?)",
       [
@@ -232,7 +265,46 @@ async function startServer() {
     );
     saveDbToDisk();
 
-    const updatedRegistrations = getAllRegistrations();
+    // Insert into Supabase
+    try {
+      let { error } = await supabase.from("registrations").insert([
+        {
+          id: newRegistration.id,
+          nome: newRegistration.nome,
+          turma: newRegistration.turma,
+          dataVisita: newRegistration.dataVisita,
+          createdAt: newRegistration.createdAt,
+        },
+      ]);
+      if (error) {
+        // Fallback for snake_case column names
+        const res2 = await supabase.from("registrations").insert([
+          {
+            id: newRegistration.id,
+            nome: newRegistration.nome,
+            turma: newRegistration.turma,
+            data_visita: newRegistration.dataVisita,
+            created_at: newRegistration.createdAt,
+          },
+        ]);
+        if (res2.error) {
+          // Fallback for lowercased column names
+          await supabase.from("registrations").insert([
+            {
+              id: newRegistration.id,
+              nome: newRegistration.nome,
+              turma: newRegistration.turma,
+              datavisita: newRegistration.dataVisita,
+              createdat: newRegistration.createdAt,
+            },
+          ]);
+        }
+      }
+    } catch (err) {
+      console.warn("Supabase insert exception:", err);
+    }
+
+    const { registrations: updatedRegistrations } = await getAllRegistrations();
     const stats = computeStats(updatedRegistrations);
 
     return res.status(201).json({
@@ -251,20 +323,20 @@ async function startServer() {
     }
   });
 
-  app.put("/api/admin/registrations/:id", (req, res) => {
+  app.put("/api/admin/registrations/:id", async (req, res) => {
     const { password, dataVisita, turma, nome } = req.body;
     if (password !== ADMIN_PASSWORD) {
       return res.status(401).json({ error: "Não autorizado." });
     }
 
     const { id } = req.params;
-    const currentReg = getRegistrationById(id);
+    const { registrations } = await getAllRegistrations();
+
+    const currentReg = registrations.find((r) => r.id === id);
 
     if (!currentReg) {
       return res.status(404).json({ error: "Inscrição não encontrada." });
     }
-
-    const registrations = getAllRegistrations();
 
     let newDate = currentReg.dataVisita;
     let newTurma = currentReg.turma;
@@ -297,13 +369,36 @@ async function startServer() {
       }
     }
 
+    // Update SQLite
     db.run(
       "UPDATE registrations SET nome = ?, turma = ?, dataVisita = ? WHERE id = ?",
       [newNome, newTurma, newDate, id]
     );
     saveDbToDisk();
 
-    const updatedRegistrations = getAllRegistrations();
+    // Update Supabase
+    try {
+      const res1 = await supabase
+        .from("registrations")
+        .update({ nome: newNome, turma: newTurma, dataVisita: newDate })
+        .eq("id", id);
+      if (res1.error) {
+        const res2 = await supabase
+          .from("registrations")
+          .update({ nome: newNome, turma: newTurma, data_visita: newDate })
+          .eq("id", id);
+        if (res2.error) {
+          await supabase
+            .from("registrations")
+            .update({ nome: newNome, turma: newTurma, datavisita: newDate })
+            .eq("id", id);
+        }
+      }
+    } catch (err) {
+      console.warn("Supabase update exception:", err);
+    }
+
+    const { registrations: updatedRegistrations } = await getAllRegistrations();
 
     return res.json({
       success: true,
@@ -312,22 +407,26 @@ async function startServer() {
     });
   });
 
-  app.delete("/api/admin/registrations/:id", (req, res) => {
+  app.delete("/api/admin/registrations/:id", async (req, res) => {
     const { password } = req.body;
     if (password !== ADMIN_PASSWORD) {
       return res.status(401).json({ error: "Não autorizado." });
     }
 
     const { id } = req.params;
-    const current = getRegistrationById(id);
-    if (!current) {
-      return res.status(404).json({ error: "Inscrição não encontrada." });
-    }
 
+    // Delete SQLite
     db.run("DELETE FROM registrations WHERE id = ?", [id]);
     saveDbToDisk();
 
-    const updatedRegistrations = getAllRegistrations();
+    // Delete Supabase
+    try {
+      await supabase.from("registrations").delete().eq("id", id);
+    } catch (err) {
+      console.warn("Supabase delete exception:", err);
+    }
+
+    const { registrations: updatedRegistrations } = await getAllRegistrations();
     return res.json({
       success: true,
       registrations: updatedRegistrations,
@@ -335,15 +434,24 @@ async function startServer() {
     });
   });
 
-  app.post("/api/admin/reset", (req, res) => {
+  app.post("/api/admin/reset", async (req, res) => {
     const { password } = req.body;
     if (password !== ADMIN_PASSWORD) {
       return res.status(401).json({ error: "Não autorizado." });
     }
 
+    // Reset SQLite
     db.run("DELETE FROM registrations");
     saveDbToDisk();
-    const updatedRegistrations = getAllRegistrations();
+
+    // Reset Supabase
+    try {
+      await supabase.from("registrations").delete().neq("id", "0");
+    } catch (err) {
+      console.warn("Supabase reset exception:", err);
+    }
+
+    const { registrations: updatedRegistrations } = await getAllRegistrations();
 
     return res.json({
       success: true,
@@ -355,7 +463,10 @@ async function startServer() {
   // Vite development or static production fallback
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: {
+        middlewareMode: true,
+        hmr: process.env.DISABLE_HMR !== "true",
+      },
       appType: "spa",
     });
     app.use(vite.middlewares);

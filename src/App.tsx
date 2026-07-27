@@ -85,7 +85,12 @@ export default function App() {
         body: JSON.stringify(formData),
       });
 
-      const data = await res.json();
+      let data: any = {};
+      try {
+        data = await res.json();
+      } catch (parseErr) {
+        console.error('Failed to parse JSON response:', parseErr);
+      }
 
       if (res.ok && data.success) {
         if (data.stats) setStats(data.stats);
@@ -98,13 +103,14 @@ export default function App() {
       } else {
         return {
           success: false,
-          error: data.error || 'Não foi possível concluir a inscrição.',
+          error: data.error || `Ocorreu um erro no servidor (código ${res.status}). Tente novamente.`,
         };
       }
-    } catch {
+    } catch (err) {
+      console.error('Registration submission fetch error:', err);
       return {
         success: false,
-        error: 'Falha na conexão com o servidor.',
+        error: 'Falha na conexão com o servidor. Verifique sua rede e tente novamente.',
       };
     }
   };

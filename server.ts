@@ -79,18 +79,24 @@ async function initDb(): Promise<Database> {
 }
 
 function getLocalRegistrations(): Registration[] {
-  const res = db.exec("SELECT id, nome, turma, dataVisita, createdAt FROM registrations ORDER BY datetime(createdAt) ASC");
-  if (!res || res.length === 0) return [];
-  const columns = res[0].columns;
-  const values = res[0].values;
+  if (!db) return [];
+  try {
+    const res = db.exec("SELECT id, nome, turma, dataVisita, createdAt FROM registrations ORDER BY datetime(createdAt) ASC");
+    if (!res || res.length === 0) return [];
+    const columns = res[0].columns;
+    const values = res[0].values;
 
-  return values.map((row) => {
-    const reg: Record<string, any> = {};
-    columns.forEach((col, idx) => {
-      reg[col] = row[idx];
+    return values.map((row) => {
+      const reg: Record<string, any> = {};
+      columns.forEach((col, idx) => {
+        reg[col] = row[idx];
+      });
+      return reg as unknown as Registration;
     });
-    return reg as unknown as Registration;
-  });
+  } catch (err) {
+    console.error("getLocalRegistrations error:", err);
+    return [];
+  }
 }
 
 function normalizeSupabaseRow(row: any): Registration {
@@ -104,30 +110,56 @@ function normalizeSupabaseRow(row: any): Registration {
 }
 
 async function getAllRegistrations(): Promise<{ registrations: Registration[]; source: string }> {
-  try {
-    const { data, error } = await supabase
-      .from("registrations")
-      .select("*");
+  let supabaseRegs: Registration[] = [];
+  let isSupabaseOk = false;
 
+  try {
+    const { data, error } = await supabase.from("registrations").select("*");
     if (!error && Array.isArray(data)) {
-      const regs = data.map(normalizeSupabaseRow);
-      // Sync to local SQLite in background
-      for (const reg of regs) {
-        db.run(
-          "INSERT OR REPLACE INTO registrations (id, nome, turma, dataVisita, createdAt) VALUES (?, ?, ?, ?, ?)",
-          [reg.id, reg.nome, reg.turma, reg.dataVisita, reg.createdAt]
-        );
-      }
-      saveDbToDisk();
-      return { registrations: regs, source: "Supabase Database" };
-    } else {
-      if (error) console.warn("Supabase query notice/error:", error.message);
+      supabaseRegs = data.map(normalizeSupabaseRow);
+      isSupabaseOk = true;
+    } else if (error) {
+      console.warn("Supabase select notice/error:", error.message);
     }
   } catch (err) {
-    console.warn("Supabase fetch exception, falling back to local SQLite:", err);
+    console.warn("Supabase fetch exception:", err);
   }
 
-  return { registrations: getLocalRegistrations(), source: "SQLite 3 (Local Backup)" };
+  const localRegs = getLocalRegistrations();
+
+  if (isSupabaseOk) {
+    // Merge local SQLite registrations with Supabase registrations by ID
+    // so locally registered items are never lost even if Supabase insert was rejected or delayed
+    const map = new Map<string, Registration>();
+    for (const r of localRegs) {
+      if (r && r.id) map.set(r.id, r);
+    }
+    for (const r of supabaseRegs) {
+      if (r && r.id) {
+        map.set(r.id, r);
+        // Keep local SQLite in sync
+        if (db) {
+          try {
+            db.run(
+              "INSERT OR REPLACE INTO registrations (id, nome, turma, dataVisita, createdAt) VALUES (?, ?, ?, ?, ?)",
+              [r.id, r.nome, r.turma, r.dataVisita, r.createdAt]
+            );
+          } catch (e) {
+            // ignore
+          }
+        }
+      }
+    }
+    saveDbToDisk();
+
+    const merged = Array.from(map.values()).sort(
+      (a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime()
+    );
+
+    return { registrations: merged, source: "Supabase Database" };
+  }
+
+  return { registrations: localRegs, source: "SQLite 3 (Local Backup)" };
 }
 
 function computeStats(registrations: Registration[]): VisitStats {
@@ -192,126 +224,137 @@ async function startServer() {
   });
 
   app.post("/api/register", async (req, res) => {
-    const { nome, turma, dataVisita } = req.body;
-
-    // Validate name
-    if (!nome || typeof nome !== "string") {
-      return res.status(400).json({ error: "O nome é obrigatório." });
-    }
-
-    const trimmedName = nome.trim().replace(/\s+/g, " ");
-    const nameParts = trimmedName.split(" ").filter((p) => p.length >= 2);
-
-    if (nameParts.length < 2) {
-      return res.status(400).json({
-        error: "Por favor, informe seu primeiro e último nome (pelo menos dois nomes).",
-      });
-    }
-
-    // Validate turma
-    const validTurmas: Turma[] = ["3º BIOTEC", "3º A INFO", "3º B INFO"];
-    if (!turma || !validTurmas.includes(turma as Turma)) {
-      return res.status(400).json({ error: "Selecione uma turma válida." });
-    }
-
-    // Validate dataVisita
-    const validDatas: DataVisita[] = ["15/08", "29/08"];
-    if (!dataVisita || !validDatas.includes(dataVisita as DataVisita)) {
-      return res.status(400).json({ error: "Selecione uma data válida para a visita." });
-    }
-
-    const { registrations } = await getAllRegistrations();
-
-    // Check capacity for chosen date
-    const dateCount = registrations.filter((r) => r.dataVisita === dataVisita).length;
-    if (dateCount >= MAX_SPOTS_PER_DATE) {
-      return res.status(400).json({
-        error: "Não há mais vagas para esta data.",
-      });
-    }
-
-    // Check duplicate: same name (case insensitive) and same turma
-    const isDuplicate = registrations.some(
-      (r) =>
-        r.nome.trim().toLowerCase() === trimmedName.toLowerCase() &&
-        r.turma === turma
-    );
-
-    if (isDuplicate) {
-      return res.status(400).json({
-        error: `Já existe uma inscrição cadastrada para "${trimmedName}" na turma ${turma}.`,
-      });
-    }
-
-    // Create registration
-    const newRegistration: Registration = {
-      id: "reg_" + Date.now() + "_" + Math.random().toString(36).substring(2, 7),
-      nome: trimmedName,
-      turma: turma as Turma,
-      dataVisita: dataVisita as DataVisita,
-      createdAt: new Date().toISOString(),
-    };
-
-    // Save to local SQLite
-    db.run(
-      "INSERT INTO registrations (id, nome, turma, dataVisita, createdAt) VALUES (?, ?, ?, ?, ?)",
-      [
-        newRegistration.id,
-        newRegistration.nome,
-        newRegistration.turma,
-        newRegistration.dataVisita,
-        newRegistration.createdAt,
-      ]
-    );
-    saveDbToDisk();
-
-    // Insert into Supabase
     try {
-      let { error } = await supabase.from("registrations").insert([
-        {
-          id: newRegistration.id,
-          nome: newRegistration.nome,
-          turma: newRegistration.turma,
-          dataVisita: newRegistration.dataVisita,
-          createdAt: newRegistration.createdAt,
-        },
-      ]);
-      if (error) {
-        // Fallback for snake_case column names
-        const res2 = await supabase.from("registrations").insert([
+      const { nome, turma, dataVisita } = req.body || {};
+
+      // Validate name
+      if (!nome || typeof nome !== "string") {
+        return res.status(400).json({ error: "O nome é obrigatório." });
+      }
+
+      const trimmedName = nome.trim().replace(/\s+/g, " ");
+      const nameParts = trimmedName.split(" ").filter((p) => p.length >= 2);
+
+      if (nameParts.length < 2) {
+        return res.status(400).json({
+          error: "Por favor, informe seu primeiro e último nome (pelo menos dois nomes).",
+        });
+      }
+
+      // Validate turma
+      const validTurmas: Turma[] = ["3º BIOTEC", "3º A INFO", "3º B INFO"];
+      if (!turma || !validTurmas.includes(turma as Turma)) {
+        return res.status(400).json({ error: "Selecione uma turma válida." });
+      }
+
+      // Validate dataVisita
+      const validDatas: DataVisita[] = ["15/08", "29/08"];
+      if (!dataVisita || !validDatas.includes(dataVisita as DataVisita)) {
+        return res.status(400).json({ error: "Selecione uma data válida para a visita." });
+      }
+
+      const { registrations } = await getAllRegistrations();
+
+      // Check capacity for chosen date
+      const dateCount = registrations.filter((r) => r.dataVisita === dataVisita).length;
+      if (dateCount >= MAX_SPOTS_PER_DATE) {
+        return res.status(400).json({
+          error: "Não há mais vagas para esta data.",
+        });
+      }
+
+      // Check duplicate: same name (case insensitive) and same turma
+      const isDuplicate = registrations.some(
+        (r) =>
+          r.nome.trim().toLowerCase() === trimmedName.toLowerCase() &&
+          r.turma === turma
+      );
+
+      if (isDuplicate) {
+        return res.status(400).json({
+          error: `Já existe uma inscrição cadastrada para "${trimmedName}" na turma ${turma}.`,
+        });
+      }
+
+      // Create registration
+      const newRegistration: Registration = {
+        id: "reg_" + Date.now() + "_" + Math.random().toString(36).substring(2, 7),
+        nome: trimmedName,
+        turma: turma as Turma,
+        dataVisita: dataVisita as DataVisita,
+        createdAt: new Date().toISOString(),
+      };
+
+      // Save to local SQLite
+      if (db) {
+        try {
+          db.run(
+            "INSERT INTO registrations (id, nome, turma, dataVisita, createdAt) VALUES (?, ?, ?, ?, ?)",
+            [
+              newRegistration.id,
+              newRegistration.nome,
+              newRegistration.turma,
+              newRegistration.dataVisita,
+              newRegistration.createdAt,
+            ]
+          );
+          saveDbToDisk();
+        } catch (sqErr) {
+          console.error("Local SQLite insert error:", sqErr);
+        }
+      }
+
+      // Insert into Supabase
+      try {
+        let { error } = await supabase.from("registrations").insert([
           {
             id: newRegistration.id,
             nome: newRegistration.nome,
             turma: newRegistration.turma,
-            data_visita: newRegistration.dataVisita,
-            created_at: newRegistration.createdAt,
+            dataVisita: newRegistration.dataVisita,
+            createdAt: newRegistration.createdAt,
           },
         ]);
-        if (res2.error) {
-          // Fallback for lowercased column names
-          await supabase.from("registrations").insert([
+        if (error) {
+          // Fallback for snake_case column names
+          const res2 = await supabase.from("registrations").insert([
             {
               id: newRegistration.id,
               nome: newRegistration.nome,
               turma: newRegistration.turma,
-              datavisita: newRegistration.dataVisita,
-              createdat: newRegistration.createdAt,
+              data_visita: newRegistration.dataVisita,
+              created_at: newRegistration.createdAt,
             },
           ]);
+          if (res2.error) {
+            // Fallback for lowercased column names
+            await supabase.from("registrations").insert([
+              {
+                id: newRegistration.id,
+                nome: newRegistration.nome,
+                turma: newRegistration.turma,
+                datavisita: newRegistration.dataVisita,
+                createdat: newRegistration.createdAt,
+              },
+            ]);
+          }
         }
+      } catch (err) {
+        console.warn("Supabase insert exception:", err);
       }
-    } catch (err) {
-      console.warn("Supabase insert exception:", err);
+
+      const { registrations: updatedRegistrations } = await getAllRegistrations();
+      const stats = computeStats(updatedRegistrations);
+
+      return res.status(201).json({
+        success: true,
+        registration: newRegistration,
+        stats,
+      });
+    } catch (err: any) {
+      console.error("Error in /api/register:", err);
+      return res.status(500).json({ error: err?.message || "Ocorreu um erro interno no servidor ao processar a inscrição." });
     }
-
-    const { registrations: updatedRegistrations } = await getAllRegistrations();
-    const stats = computeStats(updatedRegistrations);
-
-    return res.status(201).json({
-      success: true,
-      registration: newRegistration,
-      stats,
-    });
   });
 
   app.post("/api/admin/login", (req, res) => {

@@ -1,0 +1,6 @@
+{
+  "name": "Visita Técnica à Barragem do Estreito",
+  "description": "Sistema de inscrições em tempo real para a visita técnica à Barragem do Estreito - Campus Araguaína IFTO.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

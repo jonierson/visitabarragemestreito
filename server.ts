@@ -1,0 +1,375 @@
+import express from "express";
+import path from "path";
+import fs from "fs";
+import initSqlJs, { Database } from "sql.js";
+import { createServer as createViteServer } from "vite";
+import { Registration, Turma, DataVisita, VisitStats } from "./src/types";
+
+const PORT = 3000;
+const DB_FILE = path.join(process.cwd(), "registrations.json");
+const SQLITE_DB_PATH = path.join(process.cwd(), "registrations.sqlite");
+const MAX_SPOTS_PER_DATE = 38;
+const ADMIN_PASSWORD = "30012015";
+
+let db: Database;
+
+function saveDbToDisk(): void {
+  if (!db) return;
+  try {
+    const binaryArray = db.export();
+    const buffer = Buffer.from(binaryArray);
+    fs.writeFileSync(SQLITE_DB_PATH, buffer);
+  } catch (err) {
+    console.error("Error saving SQLite database to disk:", err);
+  }
+}
+
+async function initDb(): Promise<Database> {
+  const SQL = await initSqlJs();
+
+  let fileBuffer: Buffer | null = null;
+  if (fs.existsSync(SQLITE_DB_PATH)) {
+    try {
+      fileBuffer = fs.readFileSync(SQLITE_DB_PATH);
+    } catch (e) {
+      console.error("Error reading SQLite database file:", e);
+    }
+  }
+
+  const database = fileBuffer ? new SQL.Database(fileBuffer) : new SQL.Database();
+
+  database.run(`
+    CREATE TABLE IF NOT EXISTS registrations (
+      id TEXT PRIMARY KEY,
+      nome TEXT NOT NULL,
+      turma TEXT NOT NULL,
+      dataVisita TEXT NOT NULL,
+      createdAt TEXT NOT NULL
+    );
+  `);
+
+  // Migrate existing data from registrations.json if present and table is empty
+  try {
+    const res = database.exec("SELECT COUNT(*) as count FROM registrations");
+    const count = res[0] && res[0].values[0] ? (res[0].values[0][0] as number) : 0;
+    if (count === 0 && fs.existsSync(DB_FILE)) {
+      const data = fs.readFileSync(DB_FILE, "utf-8");
+      const jsonRegs: Registration[] = JSON.parse(data);
+      for (const reg of jsonRegs) {
+        database.run(
+          "INSERT OR IGNORE INTO registrations (id, nome, turma, dataVisita, createdAt) VALUES (?, ?, ?, ?, ?)",
+          [reg.id, reg.nome, reg.turma, reg.dataVisita, reg.createdAt]
+        );
+      }
+      console.log(`Migrated ${jsonRegs.length} registrations from registrations.json into SQLite database.`);
+    }
+  } catch (err) {
+    console.error("Migration error:", err);
+  }
+
+  db = database;
+  saveDbToDisk();
+  return database;
+}
+
+function getAllRegistrations(): Registration[] {
+  const res = db.exec("SELECT id, nome, turma, dataVisita, createdAt FROM registrations ORDER BY datetime(createdAt) ASC");
+  if (!res || res.length === 0) return [];
+  const columns = res[0].columns;
+  const values = res[0].values;
+
+  return values.map((row) => {
+    const reg: Record<string, any> = {};
+    columns.forEach((col, idx) => {
+      reg[col] = row[idx];
+    });
+    return reg as unknown as Registration;
+  });
+}
+
+function getRegistrationById(id: string): Registration | null {
+  const res = db.exec("SELECT id, nome, turma, dataVisita, createdAt FROM registrations WHERE id = ?", [id]);
+  if (!res || res.length === 0 || res[0].values.length === 0) return null;
+  const columns = res[0].columns;
+  const row = res[0].values[0];
+  const reg: Record<string, any> = {};
+  columns.forEach((col, idx) => {
+    reg[col] = row[idx];
+  });
+  return reg as unknown as Registration;
+}
+
+function computeStats(registrations: Registration[]): VisitStats {
+  const count15 = registrations.filter((r) => r.dataVisita === "15/08").length;
+  const count29 = registrations.filter((r) => r.dataVisita === "29/08").length;
+
+  const countBiotec = registrations.filter((r) => r.turma === "3º BIOTEC").length;
+  const countAInfo = registrations.filter((r) => r.turma === "3º A INFO").length;
+  const countBInfo = registrations.filter((r) => r.turma === "3º B INFO").length;
+
+  return {
+    capacities: {
+      "15/08": {
+        dataVisita: "15/08",
+        totalLimit: MAX_SPOTS_PER_DATE,
+        occupied: count15,
+        available: Math.max(0, MAX_SPOTS_PER_DATE - count15),
+        isFull: count15 >= MAX_SPOTS_PER_DATE,
+      },
+      "29/08": {
+        dataVisita: "29/08",
+        totalLimit: MAX_SPOTS_PER_DATE,
+        occupied: count29,
+        available: Math.max(0, MAX_SPOTS_PER_DATE - count29),
+        isFull: count29 >= MAX_SPOTS_PER_DATE,
+      },
+    },
+    totalRegistrations: registrations.length,
+    byTurma: {
+      "3º BIOTEC": countBiotec,
+      "3º A INFO": countAInfo,
+      "3º B INFO": countBInfo,
+    },
+    byData: {
+      "15/08": count15,
+      "29/08": count29,
+    },
+  };
+}
+
+async function startServer() {
+  db = await initDb();
+
+  const app = express();
+  app.use(express.json());
+
+  // API Endpoints
+  app.get("/api/stats", (req, res) => {
+    const registrations = getAllRegistrations();
+    const stats = computeStats(registrations);
+    res.json(stats);
+  });
+
+  app.get("/api/registrations", (req, res) => {
+    const registrations = getAllRegistrations();
+    res.json({
+      registrations,
+      stats: computeStats(registrations),
+      dbEngine: "SQLite 3 (sql.js)",
+    });
+  });
+
+  app.post("/api/register", (req, res) => {
+    const { nome, turma, dataVisita } = req.body;
+
+    // Validate name
+    if (!nome || typeof nome !== "string") {
+      return res.status(400).json({ error: "O nome é obrigatório." });
+    }
+
+    const trimmedName = nome.trim().replace(/\s+/g, " ");
+    const nameParts = trimmedName.split(" ").filter((p) => p.length >= 2);
+
+    if (nameParts.length < 2) {
+      return res.status(400).json({
+        error: "Por favor, informe seu primeiro e último nome (pelo menos dois nomes).",
+      });
+    }
+
+    // Validate turma
+    const validTurmas: Turma[] = ["3º BIOTEC", "3º A INFO", "3º B INFO"];
+    if (!turma || !validTurmas.includes(turma as Turma)) {
+      return res.status(400).json({ error: "Selecione uma turma válida." });
+    }
+
+    // Validate dataVisita
+    const validDatas: DataVisita[] = ["15/08", "29/08"];
+    if (!dataVisita || !validDatas.includes(dataVisita as DataVisita)) {
+      return res.status(400).json({ error: "Selecione uma data válida para a visita." });
+    }
+
+    const registrations = getAllRegistrations();
+
+    // Check capacity for chosen date
+    const dateCount = registrations.filter((r) => r.dataVisita === dataVisita).length;
+    if (dateCount >= MAX_SPOTS_PER_DATE) {
+      return res.status(400).json({
+        error: "Não há mais vagas para esta data.",
+      });
+    }
+
+    // Check duplicate: same name (case insensitive) and same turma
+    const isDuplicate = registrations.some(
+      (r) =>
+        r.nome.trim().toLowerCase() === trimmedName.toLowerCase() &&
+        r.turma === turma
+    );
+
+    if (isDuplicate) {
+      return res.status(400).json({
+        error: `Já existe uma inscrição cadastrada para "${trimmedName}" na turma ${turma}.`,
+      });
+    }
+
+    // Create registration
+    const newRegistration: Registration = {
+      id: "reg_" + Date.now() + "_" + Math.random().toString(36).substring(2, 7),
+      nome: trimmedName,
+      turma: turma as Turma,
+      dataVisita: dataVisita as DataVisita,
+      createdAt: new Date().toISOString(),
+    };
+
+    db.run(
+      "INSERT INTO registrations (id, nome, turma, dataVisita, createdAt) VALUES (?, ?, ?, ?, ?)",
+      [
+        newRegistration.id,
+        newRegistration.nome,
+        newRegistration.turma,
+        newRegistration.dataVisita,
+        newRegistration.createdAt,
+      ]
+    );
+    saveDbToDisk();
+
+    const updatedRegistrations = getAllRegistrations();
+    const stats = computeStats(updatedRegistrations);
+
+    return res.status(201).json({
+      success: true,
+      registration: newRegistration,
+      stats,
+    });
+  });
+
+  app.post("/api/admin/login", (req, res) => {
+    const { password } = req.body;
+    if (password === ADMIN_PASSWORD) {
+      return res.json({ success: true, message: "Acesso autorizado." });
+    } else {
+      return res.status(401).json({ error: "Senha incorreta. Tente novamente." });
+    }
+  });
+
+  app.put("/api/admin/registrations/:id", (req, res) => {
+    const { password, dataVisita, turma, nome } = req.body;
+    if (password !== ADMIN_PASSWORD) {
+      return res.status(401).json({ error: "Não autorizado." });
+    }
+
+    const { id } = req.params;
+    const currentReg = getRegistrationById(id);
+
+    if (!currentReg) {
+      return res.status(404).json({ error: "Inscrição não encontrada." });
+    }
+
+    const registrations = getAllRegistrations();
+
+    let newDate = currentReg.dataVisita;
+    let newTurma = currentReg.turma;
+    let newNome = currentReg.nome;
+
+    // If dataVisita is changing, check target date capacity
+    if (dataVisita && dataVisita !== currentReg.dataVisita) {
+      const validDatas: DataVisita[] = ["15/08", "29/08"];
+      if (!validDatas.includes(dataVisita as DataVisita)) {
+        return res.status(400).json({ error: "Data de visita inválida." });
+      }
+      const dateCount = registrations.filter((r) => r.dataVisita === dataVisita).length;
+      if (dateCount >= MAX_SPOTS_PER_DATE) {
+        return res.status(400).json({ error: `A data ${dataVisita} já atingiu o limite de ${MAX_SPOTS_PER_DATE} vagas.` });
+      }
+      newDate = dataVisita as DataVisita;
+    }
+
+    if (turma) {
+      const validTurmas: Turma[] = ["3º BIOTEC", "3º A INFO", "3º B INFO"];
+      if (validTurmas.includes(turma as Turma)) {
+        newTurma = turma as Turma;
+      }
+    }
+
+    if (nome && typeof nome === "string") {
+      const trimmed = nome.trim().replace(/\s+/g, " ");
+      if (trimmed.length > 0) {
+        newNome = trimmed;
+      }
+    }
+
+    db.run(
+      "UPDATE registrations SET nome = ?, turma = ?, dataVisita = ? WHERE id = ?",
+      [newNome, newTurma, newDate, id]
+    );
+    saveDbToDisk();
+
+    const updatedRegistrations = getAllRegistrations();
+
+    return res.json({
+      success: true,
+      registrations: updatedRegistrations,
+      stats: computeStats(updatedRegistrations),
+    });
+  });
+
+  app.delete("/api/admin/registrations/:id", (req, res) => {
+    const { password } = req.body;
+    if (password !== ADMIN_PASSWORD) {
+      return res.status(401).json({ error: "Não autorizado." });
+    }
+
+    const { id } = req.params;
+    const current = getRegistrationById(id);
+    if (!current) {
+      return res.status(404).json({ error: "Inscrição não encontrada." });
+    }
+
+    db.run("DELETE FROM registrations WHERE id = ?", [id]);
+    saveDbToDisk();
+
+    const updatedRegistrations = getAllRegistrations();
+    return res.json({
+      success: true,
+      registrations: updatedRegistrations,
+      stats: computeStats(updatedRegistrations),
+    });
+  });
+
+  app.post("/api/admin/reset", (req, res) => {
+    const { password } = req.body;
+    if (password !== ADMIN_PASSWORD) {
+      return res.status(401).json({ error: "Não autorizado." });
+    }
+
+    db.run("DELETE FROM registrations");
+    saveDbToDisk();
+    const updatedRegistrations = getAllRegistrations();
+
+    return res.json({
+      success: true,
+      registrations: updatedRegistrations,
+      stats: computeStats(updatedRegistrations),
+    });
+  });
+
+  // Vite development or static production fallback
+  if (process.env.NODE_ENV !== "production") {
+    const vite = await createViteServer({
+      server: { middlewareMode: true },
+      appType: "spa",
+    });
+    app.use(vite.middlewares);
+  } else {
+    const distPath = path.join(process.cwd(), "dist");
+    app.use(express.static(distPath));
+    app.get("*", (req, res) => {
+      res.sendFile(path.join(distPath, "index.html"));
+    });
+  }
+
+  app.listen(PORT, "0.0.0.0", () => {
+    console.log(`Servidor rodando em http://localhost:${PORT}`);
+  });
+}
+
+startServer();
